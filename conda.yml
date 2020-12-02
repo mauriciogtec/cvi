@@ -1,0 +1,23 @@
+name: cvi
+channels:
+  - defaults
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.8
+  - pytorch
+  - torchvision
+  - numpy
+  - matplotlib
+  - jupyterlab
+  - scipy
+  - scikit-learn
+  - seaborn
+  - flake8
+  - ffmpeg
+  - black
+  - pandas
+  - pip
+  - pip:
+      - "git+https://git@github.com/shagunsodhani/ml-logger.git@master#egg=ml_logger[all]"
+      - hydra-core

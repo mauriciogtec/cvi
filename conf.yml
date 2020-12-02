@@ -1,0 +1,71 @@
+train_cycles: 100
+collect_steps: 200
+max_value_iters: 100
+max_train_samples: 100_000
+batch_size: 20
+num_batches: 20
+device: cpu
+eval_steps: 1_000
+grid_resolution: 20
+vi_tol: 1e-3  # convergence tolerance mean abs grid error
+
+augment:
+  rollouts: true
+  HER: false
+  IER: false
+  multiplier: 10  # ignored for HER
+  rollout_horizon: 10
+
+env:
+  _target_: envs.ContinuousGridMDP
+  threshold: 0.1
+  goal: [0.0, 0.0]
+  start: [1.0, 0.0]
+  random_start: True
+  random_goal: True
+  time_limit: 30
+  state_dim: 2
+  action_dim: 2
+
+agent:
+  beta: 0.99  # value cooling factor
+  gamma: 0.99  # time discount
+  num_action_samples: 100  # to evaluate the best action
+  max_delta: 0.1  # for displacement
+  epsilon: 0.1  # exploration rate for epsilon greedy
+  state_dim: ${env.state_dim}
+  action_dim: ${env.action_dim}
+
+  transition: 
+    _target_: models.Transition
+    hidden_dim: 16
+    state_dim: ${env.state_dim}
+    action_dim: ${env.action_dim}
+
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.001
+    weight_decay: 1e-6
+    betas: [0.9, 0.99]
+    eps: 1e-4
+
+  state_value:
+    _target_: sklearn.neighbors.KNeighborsRegressor
+    n_neighbors: 5
+    weights: uniform  # distance
+
+  action_value:
+    _target_: sklearn.neighbors.KNeighborsRegressor
+    n_neighbors: 5
+    weights: uniform  # distance
+
+buffer:
+  _target_: buffers.ReplayBufferWithGoals
+  size: 100_000
+
+hydra:
+  job_logging:
+    formatters:
+      simple:
+        format: '%(asctime)s : %(message)s'
+        datefmt: '%H:%M:%S'
