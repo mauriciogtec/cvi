@@ -1,11 +1,12 @@
 import os
+from typing import Optional
 import numpy as np
 import torch
 from cvi import CVI
 from buffers import ReplayBufferWithGoals
 from envs import ContinuousGridMDP
 import matplotlib.pyplot as plt
-from matplotlib import animation
+import matplotlib
 from omegaconf import DictConfig
 import logging
 
@@ -13,6 +14,7 @@ import logging
 # turn off annoying messages while saving matplotlib video
 logger = logging.getLogger("matplotlib")
 logger.setLevel(logging.ERROR)
+matplotlib.use("Agg")  # for display-less server
 
 
 class Trainer:
@@ -33,17 +35,36 @@ class Trainer:
 
     def collect(self, random: bool = False) -> None:
         env = self.train_env
+        n = self.cfg.collect_steps
         self.agent.eval()
-        for step in range(self.cfg.collect_steps):
+        dones = []  # to compute use the # of baseline HER augments
+        for _ in range(n):
             s = self.state
             g = env.goal
             a = self.agent.select_action(s, g, greedy=False)
             s1, r, d, _ = env.step(a)
+            dones.append(d)
             self.buffer.add(s, a, r, s1, g, d)
             if d:
                 self.state, self.goal = env.reset()
             else:
                 self.state = s1
+
+        # compute how many HER augments and store
+        trajs = []
+        curr = []
+        t = 0  # possible augments in HER
+        for i in range(n):
+            if i < n - 1 and not dones[i]:
+                curr.append(i)
+            else:
+                if len(curr) > 1:
+                    trajs.append(curr)
+                    q = len(curr)
+                    t += q * (q + 1) // 2
+                curr = [i]
+        self.trajectories = trajs
+        self.her_possible_augments = t
 
     def eval(self) -> None:
         env = self.test_env
@@ -72,11 +93,13 @@ class Trainer:
         dev = self.cfg.device
 
         model_loss = 0.0
+        n = batch_size * num_batches
+        s, a, r, s1, g, _ = self.buffer.sample_most_recent(n)
         for b in range(num_batches):
-            s, a, r, s1, g, _ = self.buffer.sample(batch_size)
-            s_ = torch.FloatTensor(s).to(dev)
-            a_ = torch.FloatTensor(a).to(dev)
-            s1_ = torch.FloatTensor(s1).to(dev)
+            ix = range(b * batch_size, (b + 1) * batch_size)
+            s_ = torch.FloatTensor(s[ix]).to(dev)
+            a_ = torch.FloatTensor(a[ix]).to(dev)
+            s1_ = torch.FloatTensor(s1[ix]).to(dev)
             ls = self.agent.update_model(s_, a_, s1_)
             model_loss += ls["model"] / num_batches
         metrics = dict(model=np.round(model_loss, 4))
@@ -87,19 +110,62 @@ class Trainer:
         # 0. get training data
         self.agent.train()
         max_samples = self.cfg.max_train_samples
-        s, a, r, s1, g, _ = self.buffer.sample_all(max_samples)
 
         # 1. update state value
         v_eval, *_ = self.value_grid()
         deltas = []
+
+        s, a, r, s1, g, _ = self.buffer.sample_all(max_samples)
+
+        M = self.cfg.augment.multiplier
+        H = self.cfg.augment.rollout_horizon
+        num_rollouts = max(1, M // H)
+        if self.cfg.augment.rollouts:
+            root = s.copy()
+            s, a, r, s1, g = [], [], [], [], []
+            for _ in range(num_rollouts):
+                s_, a_, _, s1_, _, _ = self.goal_based_rollouts(root, H)
+                for i in range(1, H):
+                    if np.random.rand() < self.cfg.augment.random_goal_prob:
+                        g_aug = np.random.uniform(size=root.shape)
+                    else:
+                        g_aug = s_[i]
+                    for j in range(i):
+                        r_aug = [
+                            self.train_env.reward(ss, gg)
+                            for ss, gg in zip(s1_[j], g_aug)
+                        ]
+                        s.append(s_[j])
+                        a.append(a_[j])
+                        r.append(r_aug)
+                        s1.append(s1_[j])
+                        g.append(g_aug)
+            s = np.concatenate(s, 0)
+            a = np.concatenate(a, 0)
+            r = np.concatenate(r, 0)
+            s1 = np.concatenate(s1, 0)
+            g = np.concatenate(g, 0)
+
         for _ in range(self.cfg.max_value_iters):
             self.agent.update_state_value(s, r, s1, g)
             v_eval_new, *_ = self.value_grid()
             error = np.mean(np.abs(v_eval - v_eval_new))
             deltas.append(error)
             v_eval = v_eval_new
-            if error < self.cfg.vi_tol:
+            if error < self.cfg.vi_tol:  # success
                 break
+            elif self.cfg.resample_value_batch:
+                raise NotImplementedError
+                # s, a, r, s1, g, _ = self.buffer.sample_all(max_samples)
+                # root = s.copy()
+                # for _ in range(num_rollouts):
+                #     s_, a_, r_, s1_, g_, _ = self.goal_based_rollouts(root, H)
+                #     s = np.concatenate([s, s_], 0)
+                #     a = np.concatenate([a, a_], 0)
+                #     r = np.concatenate([r, r_], 0)
+                #     s1 = np.concatenate([s1, s1_], 0)
+                #     g = np.concatenate([g, g_], 0)
+
         self.vi_convergence = deltas  # save for plotting later
         metrics = dict(num_vi_iters=len(deltas))
 
@@ -114,7 +180,7 @@ class Trainer:
         s = s.copy()
         B = s.shape[0]
         g_actual = np.random.uniform(size=s.shape)
-        for h in range(horizon):
+        for _ in range(horizon):
             states.append(s)
             a = self.agent.select_action(s, g_actual, greedy=False)
             g = np.random.uniform(size=s.shape)
@@ -131,46 +197,40 @@ class Trainer:
             states_tp1.append(s1)
             dn.append(d)
             s = s1
-        states = np.concatenate(states, 0)
-        actions = np.concatenate(actions, 0)
-        rewards = np.concatenate(rewards, 0)
-        states_tp1 = np.concatenate(states_tp1, 0)
-        goals = np.concatenate(goals, 0)
-        dn = np.concatenate(dn, 0)
+        states = np.stack(states, 0)
+        actions = np.stack(actions, 0)
+        rewards = np.stack(rewards, 0)
+        states_tp1 = np.stack(states_tp1, 0)
+        goals = np.stack(goals, 0)
+        dn = np.stack(dn, 0)
         return states, actions, rewards, states_tp1, goals, dn
 
     # TODO:
     # separate augmented from real
-    def augment_experience(self) -> None:
+    def augment_buffer(self) -> None:
         n = self.cfg.collect_steps
-        t = self.cfg.env.time_limit
-        s, a, _, s1, _, _ = self.buffer.sample_most_recent(n)
-        M = self.cfg.augment.multiplier
+        s, a, _, s1, _, dn = self.buffer.sample_most_recent(n)
 
+        trajs = self.trajectories
         if self.cfg.augment.HER:
-            for i in range(1, n):
-                for j in range(i):
-                    g_aug = s[i]
-                    r_aug = self.env.reward(s1[j], g_aug)
-                    dn = r_aug == 1
-                    self.buffer.add(s[j], a[j], r_aug, s1[j], g_aug, dn)
+            for tau in trajs:
+                for i in range(1, len(tau)):
+                    g_aug = s[tau[i]]
+                    for j in tau[:i]:
+                        r_aug = self.train_env.reward(s1[j], g_aug)
+                        dn = r_aug == 1
+                        self.buffer.add(s[j], a[j], r_aug, s1[j], g_aug, dn)
 
+        M = self.cfg.augment.multiplier
+        B = s.shape[0]
+        num_samples = (M * self.her_possible_augments) // B
         if self.cfg.augment.IER:
-            num_samples = (t + 1) * M // 2
             for i in range(num_samples):
                 g_aug = np.random.uniform(size=self.agent.state_dim)
                 for j in range(n):
                     r_aug = self.train_env.reward(s1[j], g_aug)
                     dn = r_aug == 1.0
                     self.buffer.add(s[j], a[j], r_aug, s1[j], g_aug, dn)
-
-        if self.cfg.augment.rollouts:
-            H = self.cfg.augment.rollout_horizon
-            batches = (t + 1) * M // (2 * H)
-            for _ in range(batches):
-                s_, a_, r_, s1_, g_, d_ = self.goal_based_rollouts(s, H)
-                for j in range(s_.shape[0]):
-                    self.buffer.add(s_[j], a_[j], r_[j], s1_[j], g_[j], d_[j])
 
     def value_grid(self) -> np.array:
         env = self.train_env
@@ -222,12 +282,12 @@ class Trainer:
             scat2.set_offsets(np.expand_dims(goals[i], 0))
             return scat
 
-        anim = animation.FuncAnimation(
-            fig, animate, init_func=init, frames=100, interval=20, blit=True,
+        anim = matplotlib.animation.FuncAnimation(
+            fig, animate, init_func=init, frames=60, interval=20, blit=True,
         )
         os.makedirs(os.path.dirname(file), exist_ok=True)
         anim.save(
-            file, dpi=75, fps=4, extra_args=["-loglevel", "error"],
+            file, dpi=75, fps=6, extra_args=["-loglevel", "error"],
         )
         plt.close()
 

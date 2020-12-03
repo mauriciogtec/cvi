@@ -1,8 +1,10 @@
+import torch
 from torch import nn
 import numpy as np
 from omegaconf import DictConfig
 from torch import Tensor
 import hydra
+import copy
 
 
 class CVI(nn.Module):
@@ -23,34 +25,58 @@ class CVI(nn.Module):
         self.beta = cfg.beta
         self.gamma = cfg.gamma
         self.max_delta = cfg.max_delta
-        self.reset_value()
+        self.device = self.cfg.device
+        
+        if self.cfg.value_network:
+            pass
+        else:
+            self.reset_state_value(fill_zeros=True)
 
-    def reset_value(self, fill_zeros: bool = True) -> None:
+        self.reset_action_value(fill_zeros=True)
+
+    def reset_state_value(self, fill_zeros: bool = False) -> None:
         self.V = hydra.utils.instantiate(self.cfg.state_value)
-        self.Q = hydra.utils.instantiate(self.cfg.action_value)
-        # initialize at 0
+        if fill_zeros:
+            K = self.num_nbrs
+            s_ = np.zeros((K, self.state_dim))
+            g_ = np.zeros((K, self.state_dim))
+            y_ = np.zeros(K)
+            self.V.fit(np.concatenate([s_, g_], -1), y_)
 
+    def reset_action_value(self, fill_zeros: bool = False) -> None:
+        self.Q = hydra.utils.instantiate(self.cfg.action_value)
         if fill_zeros:
             K = self.num_nbrs
             s_ = np.zeros((K, self.state_dim))
             a_ = np.zeros((K, self.action_dim))
             g_ = np.zeros((K, self.state_dim))
             y_ = np.zeros(K)
-            self.V.fit(np.concatenate([s_, g_], -1), y_)
             self.Q.fit(np.concatenate([s_, a_, g_], -1), y_)
-
+      
     def update_state_value(
         self, s: np.array, r: np.array, s1: np.array, g: np.array,
     ) -> None:
-        """wraps the knn regression model"""
         X = np.concatenate([s, g], -1)
         X1 = np.concatenate([s1, g], -1)
-        v_s = self.beta * self.V.predict(X)
-        v_s1 = self.gamma * self.V.predict(X1)
-        tgt = np.maximum(r, np.maximum(v_s, v_s1))
-        self.reset_value(fill_zeros=False)
-        self.V.fit(X, tgt)
-        return dict(state_value=np.nan)
+        dev = self.cfg.device
+        if self.cfg.value_network:
+            B = self.cfg.value_network_batch_size
+            N = s.shape[0]
+            num_batches = N // B
+            for b in range(num_batches):
+                ix = range(b * B, (b + 1) * B)
+                s_ = torch.FloatTensor(s[ix]).to(dev)
+                a_ = torch.FloatTensor(a[ix]).to(dev)
+                s1_ = torch.FloatTensor(s1[ix]).to(dev)
+                ls = self.agent.update_model(s_, a_, s1_)
+        else:
+            v_s = self.beta * self.V.predict(X)
+            v_s1 = self.gamma * self.V.predict(X1)
+            tgt = np.maximum(r, np.maximum(v_s, v_s1))
+            self.reset_state_value()
+            self.V.fit(X, tgt)
+            metrics = dict(state_value=np.nan)
+        return metrics
 
     def update_model(
         self, s: Tensor, a: Tensor, s1: Tensor,
@@ -69,6 +95,7 @@ class CVI(nn.Module):
     def update_action_value(
         self, s: np.array, a: np.array, s1: np.array, g: np.array,
     ) -> None:
+        self.reset_action_value()
         X = np.concatenate([s, a, g], -1)
         tgt = self.V.predict(np.concatenate([s1, g], -1))
         self.Q.fit(X, tgt)
